@@ -1,4 +1,4 @@
-<!doctype html>
+<meta name='viewport' content='width=device-width, initial-scale=1'/><!doctype html>
 <html lang="pt-BR">
 <head>
   <meta charset="utf-8" />
@@ -52,24 +52,15 @@
     /* ====== PDF/PRINT ====== */
     .print-only{display:none}
     @media print{
-      /* remove fundo escuro e efeitos */
       body{background:#fff !important;color:#000 !important}
       .card{background:#fff !important; box-shadow:none !important; border:1px solid #ccc !important}
       .tag{border-color:#ccc !important}
-
-      /* esconder elementos de interação */
       button, input, select, textarea, .btns, .note, #filePick { display:none !important; }
-
-      /* imprimir melhor o gráfico: usa imagem no lugar do canvas */
       canvas{display:none !important}
       .print-only{display:block !important}
       #chartImg{width:100% !important; height:auto !important; border:1px solid #ccc !important; border-radius:10px !important}
-
-      /* tabela */
       th, td{border-bottom:1px solid #ddd !important; color:#000 !important}
       th{color:#333 !important}
-
-      /* evitar quebra feia de linhas na tabela */
       tr{page-break-inside:avoid}
     }
   </style>
@@ -77,7 +68,7 @@
 <body>
 <header>
   <h1>🌧️ Controle de Chuva</h1>
-  <p>Registre precipitação em mm, acompanhe totais e receba alertas por limite.</p>
+  <p>Registre precipitação em mm, acompanhe totais e receba alertas por limite. Agora com login + sincronização.</p>
 </header>
 
 <main>
@@ -85,8 +76,23 @@
     <div class="card span6">
       <div class="flex">
         <span class="tag" id="statusTag">Sem alerta</span>
-        <span class="small" id="lastSave">—</span>
+        <span class="small" id="lastSave">--</span>
       </div>
+
+      <!-- ===== LOGIN + SYNC ===== -->
+      <label>Login (para sincronizar entre celulares)</label>
+      <div class="row">
+        <input id="email" type="email" placeholder="seuemail@exemplo.com" />
+        <button id="btnLogin" class="ghost">Enviar link</button>
+      </div>
+      <div class="btns">
+        <button id="btnLogout" class="ghost">Sair</button>
+        <button id="btnSync" class="ghost">Sincronizar agora</button>
+      </div>
+      <div class="small" id="authState">Deslogado</div>
+      <div class="small" id="syncState">Sync: --</div>
+
+      <hr style="border:0;border-top:1px solid var(--b);margin:14px 0">
 
       <label>Data e hora</label>
       <input id="dt" type="datetime-local" />
@@ -137,7 +143,7 @@
       </div>
 
       <div class="note" style="margin-top:10px">
-        Dica: funciona offline e salva no dispositivo. Para sincronizar com sensor, veja o back-end opcional no final.
+        Offline-first: se não tiver internet, salva no celular e sincroniza quando voltar.
       </div>
       <input id="filePick" type="file" accept="application/json" style="display:none" />
     </div>
@@ -172,7 +178,6 @@
 
       <label>Gráfico (mm por dia)</label>
       <canvas id="chart" width="900" height="300"></canvas>
-      <!-- usado no PDF (impressão) -->
       <img id="chartImg" class="print-only" alt="Gráfico de chuva (mm por dia)" />
       <div class="small">Cada barra = soma do dia no período selecionado.</div>
     </div>
@@ -205,10 +210,23 @@
   </section>
 </main>
 
+<!-- Supabase JS (CDN) -->
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+
 <script>
-  // ====== Storage ======
-  const KEY = "rain_control_v1";
-  const KEY_CFG = "rain_control_cfg_v1";
+  /***********************
+   *  SUPABASE CONFIG
+   ***********************/
+  const SUPABASE_URL = "https://nplvnisfdhdcxynxpwll.supabase.co";
+  const SUPABASE_ANON_KEY = "sb_publishable_Gp4M0oxslUtmjtSC5i3gCQ_nILxwnqs";
+  const sb = supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+
+  /***********************
+   *  STORAGE (LOCAL)
+   ***********************/
+  const KEY = "rain_control_v2";
+  const KEY_CFG = "rain_control_cfg_v2";
+  const KEY_QUEUE = "rain_control_queue_v2"; // fila de sync
 
   function loadData(){
     try { return JSON.parse(localStorage.getItem(KEY)) ?? []; }
@@ -234,7 +252,20 @@
     localStorage.setItem(KEY_CFG, JSON.stringify(cfg));
   }
 
-  // ====== Utils ======
+  function loadQueue(){
+    try {
+      return JSON.parse(localStorage.getItem(KEY_QUEUE)) ?? { upserts: [], deletes: [] };
+    } catch {
+      return { upserts: [], deletes: [] };
+    }
+  }
+  function saveQueue(q){
+    localStorage.setItem(KEY_QUEUE, JSON.stringify(q));
+  }
+
+  /***********************
+   *  UTILS
+   ***********************/
   const pad2 = n => String(n).padStart(2,"0");
   function toLocalInputValue(d){
     return `${d.getFullYear()}-${pad2(d.getMonth()+1)}-${pad2(d.getDate())}T${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
@@ -258,8 +289,18 @@
     document.body.appendChild(a); a.click(); a.remove();
     URL.revokeObjectURL(url);
   }
+  function escapeHtml(s){
+    return (s+"")
+      .replaceAll("&","&amp;")
+      .replaceAll("<","&lt;")
+      .replaceAll(">","&gt;")
+      .replaceAll('"',"&quot;")
+      .replaceAll("'","&#039;");
+  }
 
-  // ====== Chart ======
+  /***********************
+   *  CHART
+   ***********************/
   const canvas = document.getElementById("chart");
   const ctx = canvas.getContext("2d");
 
@@ -329,7 +370,150 @@
     ctx.globalAlpha = 1;
   }
 
-  // ====== App state ======
+  /***********************
+   *  SUPABASE (CLOUD)
+   *  Tabela: rain_readings
+   *  colunas: id (uuid pk), user_id (uuid), ts (bigint), mm (numeric), station (text), obs (text)
+   ***********************/
+  async function getUser(){
+    const { data, error } = await sb.auth.getUser();
+    if(error) return null;
+    return data?.user ?? null;
+  }
+
+  async function loadFromCloud(){
+    const user = await getUser();
+    if(!user) return null;
+
+    const { data, error } = await sb
+      .from("rain_readings")
+      .select("id, ts, mm, station, obs")
+      .order("ts", { ascending:false });
+
+    if(error) throw error;
+
+    return (data || []).map(x => ({
+      id: x.id,
+      ts: Number(x.ts),
+      mm: Number(x.mm),
+      station: x.station || "",
+      obs: x.obs || ""
+    }));
+  }
+
+  async function upsertToCloud(items){
+    const user = await getUser();
+    if(!user) return false;
+
+    // garante user_id em tudo
+    const payload = items.map(it => ({
+      id: it.id,              // o id do cliente (uuid) vira o mesmo no banco
+      user_id: user.id,
+      ts: it.ts,
+      mm: it.mm,
+      station: it.station || "",
+      obs: it.obs || ""
+    }));
+
+    const { error } = await sb
+      .from("rain_readings")
+      .upsert(payload, { onConflict: "id" });
+
+    if(error) throw error;
+    return true;
+  }
+
+  async function deleteFromCloud(ids){
+    const user = await getUser();
+    if(!user) return false;
+
+    const { error } = await sb
+      .from("rain_readings")
+      .delete()
+      .in("id", ids);
+
+    if(error) throw error;
+    return true;
+  }
+
+  /***********************
+   *  SYNC ENGINE (offline-first)
+   ***********************/
+  const elAuthState = document.getElementById("authState");
+  const elSyncState = document.getElementById("syncState");
+
+  function setSyncState(msg){
+    elSyncState.textContent = "Sync: " + msg;
+  }
+
+  function queueUpsert(item){
+    const q = loadQueue();
+    // evita duplicar o mesmo id na fila
+    q.upserts = q.upserts.filter(x => x.id !== item.id);
+    q.upserts.push(item);
+    // se estava marcado para deletar, remove do delete
+    q.deletes = q.deletes.filter(id => id !== item.id);
+    saveQueue(q);
+  }
+
+  function queueDelete(id){
+    const q = loadQueue();
+    // remove de upserts se existir
+    q.upserts = q.upserts.filter(x => x.id !== id);
+    if(!q.deletes.includes(id)) q.deletes.push(id);
+    saveQueue(q);
+  }
+
+  async function syncNow({pullAfter=true} = {}){
+    const user = await getUser();
+    if(!user){
+      setSyncState("Faça login para sincronizar.");
+      return;
+    }
+
+    const q = loadQueue();
+    if(!q.upserts.length && !q.deletes.length){
+      setSyncState("Nada pendente.");
+      if(pullAfter){
+        const cloud = await loadFromCloud();
+        if(cloud){ data = cloud; saveData(data); render(); }
+      }
+      return;
+    }
+
+    try{
+      setSyncState(`Enviando pendências... (upserts: ${q.upserts.length}, deletes: ${q.deletes.length})`);
+
+      // 1) deletes
+      if(q.deletes.length){
+        await deleteFromCloud(q.deletes);
+      }
+
+      // 2) upserts
+      if(q.upserts.length){
+        await upsertToCloud(q.upserts);
+      }
+
+      // limpa fila
+      saveQueue({ upserts: [], deletes: [] });
+
+      // puxa estado oficial
+      if(pullAfter){
+        const cloud = await loadFromCloud();
+        if(cloud){ data = cloud; saveData(data); }
+      }
+
+      setSyncState("Sincronizado ✅");
+      render();
+    }catch(e){
+      setSyncState("Falhou (offline?). Mantive na fila.");
+      console.log(e);
+    }
+  }
+
+  /***********************
+   *  APP STATE
+   ***********************/
   let data = loadData();
   let cfg = loadCfg();
 
@@ -351,7 +535,6 @@
   const elNotifyState = document.getElementById("notifyState");
   const filePick = document.getElementById("filePick");
 
-  // init form
   elDt.value = toLocalInputValue(new Date());
   elLimitDaily.value = cfg.limitDaily;
   elLimitHour.value = cfg.limitHour;
@@ -433,7 +616,6 @@
 
   function render(){
     const filtered = getFiltered();
-
     elCountInfo.textContent = `${filtered.length} registro(s) mostrado(s) • ${data.length} total`;
 
     elTbody.innerHTML = "";
@@ -444,7 +626,7 @@
       tr.innerHTML = `
         <td>${d.toLocaleString()}</td>
         <td><strong>${Number(item.mm).toFixed(1)}</strong></td>
-        <td>${escapeHtml(item.station||"—")}</td>
+        <td>${escapeHtml(item.station||"--")}</td>
         <td>${escapeHtml(item.obs||"")}</td>
         <td><button class="ghost" data-del="${item.id}">Excluir</button></td>
       `;
@@ -458,16 +640,9 @@
     maybeNotify(k);
   }
 
-  function escapeHtml(s){
-    return (s+"")
-      .replaceAll("&","&amp;")
-      .replaceAll("<","&lt;")
-      .replaceAll(">","&gt;")
-      .replaceAll('"',"&quot;")
-      .replaceAll("'","&#039;");
-  }
-
-  // ====== Notifications ======
+  /***********************
+   *  NOTIFICATIONS
+   ***********************/
   let notifiedKey = "";
   async function enableNotify(){
     if(!("Notification" in window)){
@@ -495,17 +670,12 @@
     notifiedKey = key;
   }
 
-  // ====== PDF (Salvar) ======
+  /***********************
+   *  PDF
+   ***********************/
   function saveAsPDF(){
-    // garante que o gráfico vai sair no PDF (canvas -> imagem)
     const img = document.getElementById("chartImg");
-    try{
-      img.src = canvas.toDataURL("image/png");
-    }catch(e){
-      // se o navegador bloquear, só imprime do jeito que estiver
-    }
-
-    // dica: o PDF vai pegar o que está filtrado na tela (período + busca)
+    try{ img.src = canvas.toDataURL("image/png"); } catch(e){}
     const oldTitle = document.title;
     document.title = "controle-de-chuva-" + ymd(new Date());
     window.print();
@@ -513,8 +683,61 @@
   }
   document.getElementById("btnPdf").addEventListener("click", saveAsPDF);
 
-  // ====== Actions ======
-  document.getElementById("btnAdd").addEventListener("click", ()=>{
+  /***********************
+   *  LOGIN (MAGIC LINK)
+   ***********************/
+  document.getElementById("btnLogin").addEventListener("click", async ()=>{
+    const email = document.getElementById("email").value.trim();
+    if(!email) return alert("Informe seu email.");
+
+    try{
+      const redirectTo = window.location.origin + window.location.pathname;
+      const { error } = await sb.auth.signInWithOtp({
+        email,
+        options: { emailRedirectTo: redirectTo }
+      });
+      if(error) throw error;
+
+      alert("Enviei um link de login para seu email. Abra no celular e confirme.");
+    }catch(e){
+      alert("Falha ao enviar link: " + (e?.message || e));
+    }
+  });
+
+  document.getElementById("btnLogout").addEventListener("click", async ()=>{
+    await sb.auth.signOut();
+  });
+
+  document.getElementById("btnSync").addEventListener("click", async ()=>{
+    await syncNow({pullAfter:true});
+  });
+
+  async function refreshAuthUI(){
+    const { data: { session } } = await sb.auth.getSession();
+    if(session?.user){
+      elAuthState.textContent = "Logado: " + session.user.email;
+      setSyncState("Pronto para sincronizar.");
+    }else{
+      elAuthState.textContent = "Deslogado";
+      setSyncState("--");
+    }
+  }
+
+  // quando logar/voltar de redirect do email
+  sb.auth.onAuthStateChange(async (_event, session)=>{
+    if(session?.user){
+      elAuthState.textContent = "Logado: " + session.user.email;
+      // tenta sincronizar pendências e depois puxa a nuvem
+      await syncNow({pullAfter:true});
+    }else{
+      elAuthState.textContent = "Deslogado";
+    }
+  });
+
+  /***********************
+   *  ACTIONS
+   ***********************/
+  document.getElementById("btnAdd").addEventListener("click", async ()=>{
     const d = parseLocalInput(elDt.value);
     const mm = Number(elMm.value);
     if(!d){ alert("Data/hora inválida."); return; }
@@ -528,9 +751,18 @@
       obs: (elObs.value||"").trim()
     };
 
+    // salva local primeiro
     data.push(item);
     saveData(data);
 
+    // enfileira para sync
+    queueUpsert(item);
+    setSyncState("Pendente (salvo offline).");
+
+    // tenta sync imediata se estiver logado
+    await syncNow({pullAfter:true});
+
+    // reset campos
     elMm.value = "";
     elObs.value = "";
     elDt.value = toLocalInputValue(new Date());
@@ -568,15 +800,24 @@
 
   elNotifyBtn.addEventListener("click", enableNotify);
 
-  elTbody.addEventListener("click", (e)=>{
+  // delete row
+  elTbody.addEventListener("click", async (e)=>{
     const btn = e.target.closest("button[data-del]");
     if(!btn) return;
     const id = btn.getAttribute("data-del");
+
+    // remove local
     data = data.filter(x=>x.id !== id);
     saveData(data);
     render();
+
+    // enfileira delete + tenta sync
+    queueDelete(id);
+    setSyncState("Exclusão pendente (offline).");
+    await syncNow({pullAfter:true});
   });
 
+  // export CSV (local data atual)
   document.getElementById("btnExport").addEventListener("click", ()=>{
     const rows = [["datetime","mm","station","obs"]];
     data
@@ -589,11 +830,19 @@
     downloadText("chuva.csv", csv);
   });
 
+  // backup JSON (inclui fila)
   document.getElementById("btnBackup").addEventListener("click", ()=>{
-    const backup = { version:1, exportedAt: new Date().toISOString(), cfg, data };
+    const backup = {
+      version:2,
+      exportedAt: new Date().toISOString(),
+      cfg,
+      data,
+      queue: loadQueue()
+    };
     downloadText("backup-chuva.json", JSON.stringify(backup, null, 2));
   });
 
+  // import JSON
   document.getElementById("btnImport").addEventListener("click", ()=>{
     filePick.value = "";
     filePick.click();
@@ -605,12 +854,24 @@
       const text = await file.text();
       const obj = JSON.parse(text);
       if(!obj || !Array.isArray(obj.data)) throw new Error("Formato inválido");
+
       data = obj.data;
       cfg = obj.cfg || cfg;
+
       saveData(data);
       saveCfg(cfg);
+
+      // restaura fila se existir (opcional)
+      if(obj.queue && typeof obj.queue === "object"){
+        saveQueue({
+          upserts: Array.isArray(obj.queue.upserts) ? obj.queue.upserts : [],
+          deletes: Array.isArray(obj.queue.deletes) ? obj.queue.deletes : []
+        });
+      }
+
       elLimitDaily.value = cfg.limitDaily ?? elLimitDaily.value;
       elLimitHour.value = cfg.limitHour ?? elLimitHour.value;
+
       render();
       alert("Importado com sucesso!");
     }catch(err){
@@ -618,18 +879,30 @@
     }
   });
 
+  // wipe (local + fila; nuvem só se logado e você sincronizar depois)
   document.getElementById("btnWipe").addEventListener("click", ()=>{
-    if(!confirm("Apagar TODOS os registros?")) return;
+    if(!confirm("Apagar TODOS os registros locais?")) return;
+    // marca deletes para tudo que existe localmente (para deletar na nuvem depois)
+    const ids = data.map(x=>x.id);
+    const q = loadQueue();
+    ids.forEach(id=>{
+      q.upserts = q.upserts.filter(x=>x.id !== id);
+      if(!q.deletes.includes(id)) q.deletes.push(id);
+    });
+    saveQueue(q);
+
     data = [];
     saveData(data);
     render();
+    setSyncState("Tudo apagado local. Faça Sync para refletir na nuvem.");
   });
 
+  // demo data
   document.getElementById("btnDemo").addEventListener("click", ()=>{
-    if(!confirm("Gerar dados de teste (substitui o histórico atual)?")) return;
+    if(!confirm("Gerar dados de teste (substitui o histórico local atual)?")) return;
     const now = Date.now();
     const mk = (daysAgo, hour, mm) => ({
-      id: String(now) + Math.random().toString(16).slice(2),
+      id: crypto.randomUUID ? crypto.randomUUID() : String(now) + Math.random().toString(16).slice(2),
       ts: now - daysAgo*24*3600*1000 + hour*3600*1000,
       mm,
       station: "Pluviômetro",
@@ -644,13 +917,27 @@
     }
     data = demo;
     saveData(data);
+
+    // marca tudo para subir
+    const q = loadQueue();
+    demo.forEach(it=>{
+      q.upserts = q.upserts.filter(x => x.id !== it.id);
+      q.upserts.push(it);
+    });
+    saveQueue(q);
+    setSyncState("Dados de teste pendentes. Clique Sync.");
+
     render();
   });
 
+  /***********************
+   *  INIT
+   ***********************/
   document.getElementById("btnSort").textContent = "Ordenar: " + (cfg.sort === "desc" ? "mais recentes" : "mais antigos");
   document.getElementById("notifyState").textContent =
     ("Notification" in window) ? (Notification.permission === "granted" ? "Ativado" : "Desativado") : "Não suportado";
 
+  refreshAuthUI().then(()=>{});
   render();
 </script>
 </body>
